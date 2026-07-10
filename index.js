@@ -226,5 +226,211 @@ app.get("/api/verify-email", (req, res) => {
 // ── HEALTH CHECK ──────────────────────────────────────────
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
+// =====================================================================
+// BLOQUE PARA AGREGAR A index.js — Fase 2A.2
+// Copia todo este bloque y pégalo en index.js, ANTES de la línea:
+//   const PORT = process.env.PORT || 3001;
+// =====================================================================
+
+const bcrypt = require('bcryptjs');
+const { pool } = require('./db');
+
+// ─── REGISTRO (usa base de datos en vez de localStorage) ───────────────
+app.post('/api/auth/register', async (req, res) => {
+  const { email, password, firstName, lastName, country, language, company, role } = req.body || {};
+  if (!email || !email.includes('@')) return res.status(400).json({ success: false, error: 'invalid_email' });
+  if (!password || password.length < 6) return res.status(400).json({ success: false, error: 'weak_password' });
+
+  try {
+    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ success: false, error: 'email_already_exists' });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const insertUser = await pool.query(
+      `INSERT INTO users (email, password_hash, first_name, last_name, country, language, company, role_title)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+      [email, passwordHash, firstName, lastName, country, language || 'es', company || '', role || '']
+    );
+    const userId = insertUser.rows[0].id;
+
+    await pool.query(
+      `INSERT INTO trial_usage (user_id, searches_used, search_limit) VALUES ($1, 0, 7)`,
+      [userId]
+    );
+
+    await pool.query(
+      `INSERT INTO audit_logs (user_id, event_type, metadata) VALUES ($1, 'account_created', $2)`,
+      [userId, JSON.stringify({ email })]
+    );
+
+    // Reutiliza la lógica existente de envío de correo (misma que ya tienes)
+    const language2 = ["es", "en", "fr"].includes(language) ? language : "es";
+    const jti = crypto.randomUUID();
+    const token = jwt.sign({ email, userId, type: "email_verification", jti }, JWT_SECRET, { expiresIn: TOKEN_TTL });
+    const verificationUrl = `${APP_URL}/?verify=${encodeURIComponent(token)}`;
+    const { subject, html } = buildVerificationEmail({ name: firstName, verificationUrl, lang: language2 });
+
+    await pool.query(
+      `INSERT INTO email_verification_tokens (user_id, token_jti, expires_at)
+       VALUES ($1, $2, now() + interval '30 minutes')`,
+      [userId, jti]
+    );
+
+    try {
+      const result = await resend.emails.send({
+        from: `${FROM_NAME} <${FROM_EMAIL}>`,
+        to: email,
+        subject,
+        html,
+      });
+      if (result.error) {
+        console.error("Resend error (register):", result.error);
+        return res.json({ success: true, emailError: true });
+      }
+    } catch (err) {
+      console.error("Email exception (register):", err.message);
+      return res.json({ success: true, emailError: true });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Register error:", err.message);
+    res.status(500).json({ success: false, error: "internal_error" });
+  }
+});
+
+// ─── LOGIN ───────────────────────────────────────────────────────────
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ success: false, error: 'missing_fields' });
+
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (result.rows.length === 0) {
+      return res.status(401).json({ success: false, error: 'invalid_credentials' });
+    }
+    const user = result.rows[0];
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) {
+      await pool.query(
+        `INSERT INTO audit_logs (user_id, event_type) VALUES ($1, 'login_failed')`,
+        [user.id]
+      );
+      return res.status(401).json({ success: false, error: 'invalid_credentials' });
+    }
+
+    const sessionToken = crypto.randomUUID();
+    const tokenHash = require('crypto').createHash('sha256').update(sessionToken).digest('hex');
+    await pool.query(
+      `INSERT INTO sessions (user_id, token_hash, expires_at) VALUES ($1, $2, now() + interval '30 days')`,
+      [user.id, tokenHash]
+    );
+    await pool.query(
+      `INSERT INTO audit_logs (user_id, event_type) VALUES ($1, 'login_success')`,
+      [user.id]
+    );
+
+    res.json({
+      success: true,
+      sessionToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        country: user.country,
+        language: user.language,
+        isVerified: user.is_verified,
+        isPremium: user.is_premium,
+      },
+    });
+  } catch (err) {
+    console.error("Login error:", err.message);
+    res.status(500).json({ success: false, error: "internal_error" });
+  }
+});
+
+// ─── VALIDAR SESIÓN (para restaurar sesión al abrir la app) ────────────
+app.post('/api/auth/session', async (req, res) => {
+  const { sessionToken } = req.body || {};
+  if (!sessionToken) return res.status(400).json({ success: false, error: 'missing_token' });
+
+  try {
+    const tokenHash = require('crypto').createHash('sha256').update(sessionToken).digest('hex');
+    const result = await pool.query(
+      `SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+       WHERE s.token_hash = $1 AND s.expires_at > now()`,
+      [tokenHash]
+    );
+    if (result.rows.length === 0) {
+      return res.status(401).json({ success: false, error: 'invalid_session' });
+    }
+    const user = result.rows[0];
+    res.json({
+      success: true,
+      user: {
+        id: user.id,
+        email: user.email,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        country: user.country,
+        language: user.language,
+        isVerified: user.is_verified,
+        isPremium: user.is_premium,
+      },
+    });
+  } catch (err) {
+    console.error("Session check error:", err.message);
+    res.status(500).json({ success: false, error: "internal_error" });
+  }
+});
+
+// ─── TRIAL (backend, no manipulable desde localStorage) ────────────────
+app.post('/api/trial/check', async (req, res) => {
+  const { anonymousId } = req.body || {};
+  if (!anonymousId) return res.status(400).json({ success: false, error: 'missing_id' });
+
+  try {
+    let result = await pool.query('SELECT * FROM trial_usage WHERE anonymous_id = $1', [anonymousId]);
+    if (result.rows.length === 0) {
+      result = await pool.query(
+        `INSERT INTO trial_usage (anonymous_id, searches_used, search_limit) VALUES ($1, 0, 7) RETURNING *`,
+        [anonymousId]
+      );
+    }
+    const row = result.rows[0];
+    res.json({ success: true, searchesUsed: row.searches_used, searchLimit: row.search_limit });
+  } catch (err) {
+    console.error("Trial check error:", err.message);
+    res.status(500).json({ success: false, error: "internal_error" });
+  }
+});
+
+app.post('/api/trial/increment', async (req, res) => {
+  const { anonymousId } = req.body || {};
+  if (!anonymousId) return res.status(400).json({ success: false, error: 'missing_id' });
+
+  try {
+    const result = await pool.query(
+      `UPDATE trial_usage SET searches_used = searches_used + 1, updated_at = now()
+       WHERE anonymous_id = $1 RETURNING *`,
+      [anonymousId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'not_found' });
+    }
+    const row = result.rows[0];
+    res.json({ success: true, searchesUsed: row.searches_used, searchLimit: row.search_limit });
+  } catch (err) {
+    console.error("Trial increment error:", err.message);
+    res.status(500).json({ success: false, error: "internal_error" });
+  }
+});
+
+// =====================================================================
+// FIN DEL BLOQUE A AGREGAR
+// =====================================================================
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`Fair Compes API running on port ${PORT}`));
