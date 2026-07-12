@@ -201,6 +201,7 @@ app.post("/api/resend-verification-email", async (req, res) => {
 
 // ── NUEVO: VERIFICAR TOKEN DEL ENLACE ─────────────────────
 app.get("/api/verify-email", (req, res) => {
+ app.get("/api/verify-email", async (req, res) => {
   const { token } = req.query || {};
   if (!token) return res.status(400).json({ success: false, error: "missing_token" });
 
@@ -213,12 +214,19 @@ app.get("/api/verify-email", (req, res) => {
       return res.status(400).json({ success: false, error: "token_already_used" });
     }
     consumedTokens.add(payload.jti);
+
+    await pool.query(
+      `UPDATE users SET is_verified = true WHERE email = $1`,
+      [payload.email]
+    );
+
     console.log("Email verified:", payload.email);
     res.json({ success: true, email: payload.email });
   } catch (err) {
     if (err.name === "TokenExpiredError") {
       return res.status(400).json({ success: false, error: "token_expired" });
     }
+    console.error("Verify email error:", err.message);
     res.status(400).json({ success: false, error: "invalid_token" });
   }
 });
