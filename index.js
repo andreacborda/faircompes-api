@@ -200,8 +200,7 @@ app.post("/api/resend-verification-email", async (req, res) => {
 });
 
 // ── NUEVO: VERIFICAR TOKEN DEL ENLACE ─────────────────────
-app.get("/api/verify-email", (req, res) => {
- app.get("/api/verify-email", async (req, res) => {
+app.get("/api/verify-email", async (req, res) => {
   const { token } = req.query || {};
   if (!token) return res.status(400).json({ success: false, error: "missing_token" });
 
