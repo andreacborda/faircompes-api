@@ -5,8 +5,52 @@ const { Resend } = require("resend");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
 
+const Stripe = require("stripe");
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
 app.use(cors());
+
+// ── STRIPE WEBHOOK (debe ir ANTES de express.json(), Stripe necesita el body crudo) ──
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const userId = session.metadata?.userId;
+      if (userId) {
+        await pool.query(
+          `UPDATE users SET is_premium = true, stripe_subscription_id = $1 WHERE id = $2`,
+          [session.subscription, userId]
+        );
+        console.log('User upgraded to premium:', userId);
+      }
+    }
+
+    if (event.type === 'customer.subscription.deleted') {
+      const subscription = event.data.object;
+      await pool.query(
+        `UPDATE users SET is_premium = false WHERE stripe_subscription_id = $1`,
+        [subscription.id]
+      );
+      console.log('Subscription cancelled:', subscription.id);
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error('Webhook handler error:', err.message);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 app.use(express.json());
 
 // ── CLIENTES ──────────────────────────────────────────────
@@ -359,6 +403,48 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+// ─── STRIPE: CREAR SESIÓN DE PAGO ───────────────────────────────────────
+app.post('/api/stripe/create-checkout-session', async (req, res) => {
+  const { sessionToken } = req.body || {};
+  if (!sessionToken) return res.status(400).json({ success: false, error: 'missing_token' });
+
+  try {
+    const tokenHash = require('crypto').createHash('sha256').update(sessionToken).digest('hex');
+    const result = await pool.query(
+      `SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+       WHERE s.token_hash = $1 AND s.expires_at > now()`,
+      [tokenHash]
+    );
+    if (result.rows.length === 0) {
+      return res.status(401).json({ success: false, error: 'invalid_session' });
+    }
+    const user = result.rows[0];
+
+    let customerId = user.stripe_customer_id;
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: user.email,
+        name: `${user.first_name} ${user.last_name}`,
+      });
+      customerId = customer.id;
+      await pool.query(`UPDATE users SET stripe_customer_id = $1 WHERE id = $2`, [customerId, user.id]);
+    }
+
+    const checkoutSession = await stripe.checkout.sessions.create({
+      customer: customerId,
+      mode: 'subscription',
+      line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
+      success_url: `${APP_URL}/?subscribed=true`,
+      cancel_url: `${APP_URL}/?subscribed=cancelled`,
+      metadata: { userId: user.id },
+    });
+
+    res.json({ success: true, url: checkoutSession.url });
+  } catch (err) {
+    console.error('Create checkout session error:', err.message);
+    res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
 // ─── VALIDAR SESIÓN (para restaurar sesión al abrir la app) ────────────
 app.post('/api/auth/session', async (req, res) => {
   const { sessionToken } = req.body || {};
