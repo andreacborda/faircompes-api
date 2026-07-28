@@ -280,6 +280,70 @@ app.get("/health", (req, res) => res.json({ status: "ok" }));
 // =====================================================================
 // BLOQUE PARA AGREGAR A index.js — Fase 2A.2
 // Copia todo este bloque y pégalo en index.js, ANTES de la línea:
+// ─── ELIMINAR CUENTA (anonimización, no borrado físico) ────────────────
+// Requiere sessionToken válido. Anonimiza los datos personales del usuario,
+// cancela su suscripción activa en Stripe si la tiene, invalida todas sus
+// sesiones, y deja registro en audit_logs antes de anonimizar.
+app.post('/api/user/delete', async (req, res) => {
+  const { sessionToken } = req.body || {};
+  if (!sessionToken) return res.status(400).json({ success: false, error: 'missing_token' });
+
+  try {
+    const tokenHash = require('crypto').createHash('sha256').update(sessionToken).digest('hex');
+    const result = await pool.query(
+      `SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+       WHERE s.token_hash = $1 AND s.expires_at > now()`,
+      [tokenHash]
+    );
+    if (result.rows.length === 0) {
+      return res.status(401).json({ success: false, error: 'invalid_session' });
+    }
+    const user = result.rows[0];
+
+    // 1) Registrar el evento ANTES de anonimizar (para no perder el email real en el log)
+    await pool.query(
+      `INSERT INTO audit_logs (user_id, event_type, metadata) VALUES ($1, 'account_deleted', $2)`,
+      [user.id, JSON.stringify({ email: user.email })]
+    );
+
+    // 2) Cancelar suscripción activa en Stripe, si la tiene
+    if (user.stripe_subscription_id) {
+      try {
+        await stripe.subscriptions.cancel(user.stripe_subscription_id);
+      } catch (stripeErr) {
+        // Si ya estaba cancelada o no existe, seguimos igual con la anonimización
+        console.error('Stripe cancel on account delete:', stripeErr.message);
+      }
+    }
+
+    // 3) Anonimizar los datos personales (mantiene la fila por integridad referencial
+    //    con pagos, audit_logs, etc., pero ya no identifica a la persona)
+    const anonEmail = `deleted_user_${user.id}@anon.faircompes.com`;
+    await pool.query(
+      `UPDATE users
+       SET email = $1,
+           first_name = NULL,
+           last_name = NULL,
+           company = NULL,
+           role_title = NULL,
+           password_hash = 'ACCOUNT_DELETED',
+           is_premium = false,
+           stripe_customer_id = NULL,
+           stripe_subscription_id = NULL
+       WHERE id = $2`,
+      [anonEmail, user.id]
+    );
+
+    // 4) Invalidar todas las sesiones activas del usuario (cierra sesión en todos lados)
+    await pool.query(`DELETE FROM sessions WHERE user_id = $1`, [user.id]);
+
+    console.log('Account deleted/anonymized:', user.id);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Delete account error:', err.message);
+    res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
 //   const PORT = process.env.PORT || 3001;
 // =====================================================================
 
