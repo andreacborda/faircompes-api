@@ -318,14 +318,14 @@ app.post('/api/user/delete', async (req, res) => {
 
     // 3) Anonimizar los datos personales (mantiene la fila por integridad referencial
     //    con pagos, audit_logs, etc., pero ya no identifica a la persona)
-    const anonEmail = `deleted_user_${user.id}@anon.faircompes.com`;
+const anonEmail = `deleted_user_${user.id}@anon.faircompes.com`;
     await pool.query(
       `UPDATE users
        SET email = $1,
-           first_name = NULL,
-           last_name = NULL,
-           company = NULL,
-           role_title = NULL,
+           first_name = '[eliminado]',
+           last_name = '[eliminado]',
+           company = '',
+           role_title = '',
            password_hash = 'ACCOUNT_DELETED',
            is_premium = false,
            stripe_customer_id = NULL,
