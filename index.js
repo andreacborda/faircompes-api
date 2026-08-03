@@ -583,7 +583,7 @@ app.post('/api/lemonsqueezy/create-checkout-url', async (req, res) => {
       'checkout[success_url]': `${APP_URL}/?subscribed=true`,
     });
 
-    const checkoutUrl = `https://${storeSlug}.lemonsqueezy.com/buy/${variantId}?${params.toString()}`;
+    const checkoutUrl = `https://${storeSlug}.lemonsqueezy.com/checkout/buy/${va
 
     res.json({ success: true, url: checkoutUrl });
   } catch (err) {
