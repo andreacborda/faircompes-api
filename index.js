@@ -51,6 +51,55 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
   }
 });
 
+// ─── LEMON SQUEEZY: WEBHOOK (confirmación de pagos) ─────────────────────
+app.post('/api/lemonsqueezy/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const signature = req.headers['x-signature'];
+  const secret = process.env.LEMONSQUEEZY_WEBHOOK_SECRET;
+
+  try {
+    const hmac = require('crypto').createHmac('sha256', secret);
+    const digest = hmac.update(req.body).digest('hex');
+    if (signature !== digest) {
+      console.error('Lemon Squeezy webhook: invalid signature');
+      return res.status(400).json({ error: 'invalid_signature' });
+    }
+
+    const payload = JSON.parse(req.body.toString());
+    const eventName = payload.meta?.event_name;
+    const userId = payload.meta?.custom_data?.user_id;
+
+    if (!userId) {
+      console.log('Lemon Squeezy webhook: no user_id in custom_data, ignoring event', eventName);
+      return res.json({ received: true });
+    }
+
+    if (eventName === 'subscription_created' || eventName === 'subscription_updated') {
+      const status = payload.data?.attributes?.status;
+      const subscriptionId = payload.data?.id;
+      if (status === 'active' || status === 'on_trial') {
+        await pool.query(
+          `UPDATE users SET is_premium = true, lemonsqueezy_subscription_id = $1 WHERE id = $2`,
+          [subscriptionId, userId]
+        );
+        console.log('User upgraded to premium (Lemon Squeezy):', userId);
+      } else if (status === 'cancelled' || status === 'expired' || status === 'unpaid') {
+        await pool.query(`UPDATE users SET is_premium = false WHERE id = $1`, [userId]);
+        console.log('User downgraded (Lemon Squeezy):', userId, status);
+      }
+    }
+
+    if (eventName === 'subscription_cancelled' || eventName === 'subscription_expired') {
+      await pool.query(`UPDATE users SET is_premium = false WHERE id = $1`, [userId]);
+      console.log('Subscription cancelled/expired (Lemon Squeezy):', userId);
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error('Lemon Squeezy webhook handler error:', err.message);
+    res.status(500).json({ error: 'internal_error' });
+}
+});
+
 app.use(express.json());
 
 // ── CLIENTES ──────────────────────────────────────────────
@@ -506,6 +555,39 @@ app.post('/api/stripe/create-checkout-session', async (req, res) => {
     res.json({ success: true, url: checkoutSession.url });
   } catch (err) {
     console.error('Create checkout session error:', err.message);
+    res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});// ─── LEMON SQUEEZY: CREAR URL DE CHECKOUT ───────────────────────────────
+app.post('/api/lemonsqueezy/create-checkout-url', async (req, res) => {
+  const { sessionToken } = req.body || {};
+  if (!sessionToken) return res.status(400).json({ success: false, error: 'missing_token' });
+
+  try {
+    const tokenHash = require('crypto').createHash('sha256').update(sessionToken).digest('hex');
+    const result = await pool.query(
+      `SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+       WHERE s.token_hash = $1 AND s.expires_at > now()`,
+      [tokenHash]
+    );
+    if (result.rows.length === 0) {
+      return res.status(401).json({ success: false, error: 'invalid_session' });
+    }
+    const user = result.rows[0];
+
+    const variantId = process.env.LEMONSQUEEZY_VARIANT_ID;
+    const storeSlug = process.env.LEMONSQUEEZY_STORE_SLUG || 'faircompesai';
+
+    const params = new URLSearchParams({
+      'checkout[email]': user.email,
+      'checkout[custom][user_id]': user.id,
+      'checkout[success_url]': `${APP_URL}/?subscribed=true`,
+    });
+
+    const checkoutUrl = `https://${storeSlug}.lemonsqueezy.com/buy/${variantId}?${params.toString()}`;
+
+    res.json({ success: true, url: checkoutUrl });
+  } catch (err) {
+    console.error('Create Lemon Squeezy checkout error:', err.message);
     res.status(500).json({ success: false, error: 'internal_error' });
   }
 });
