@@ -574,7 +574,6 @@ app.post('/api/lemonsqueezy/create-checkout-url', async (req, res) => {
     }
     const user = result.rows[0];
 
-    const variantId = process.env.LEMONSQUEEZY_VARIANT_ID;
     const storeSlug = process.env.LEMONSQUEEZY_STORE_SLUG || 'faircompesai';
 
     const params = new URLSearchParams({
@@ -583,7 +582,7 @@ app.post('/api/lemonsqueezy/create-checkout-url', async (req, res) => {
       'checkout[success_url]': `${APP_URL}/?subscribed=true`,
     });
 
-    const checkoutUrl = `https://${storeSlug}.lemonsqueezy.com/checkout/buy/${variantId}?${params.toString()}`;
+    const checkoutUrl = `https://faircompesai.lemonsqueezy.com/checkout/buy/91c68b65-fd82-4339-9b8c-9d94324313a3?${params.toString()}`;
 
     res.json({ success: true, url: checkoutUrl });
   } catch (err) {
