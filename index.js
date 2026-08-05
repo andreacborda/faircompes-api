@@ -283,7 +283,155 @@ app.get("/api/verify-email", async (req, res) => {
   }
 });
 
-// ── HEALTH CHECK ──────────────────────────────────────────
+// ── PLANTILLA DE CORREO: RECUPERAR CONTRASEÑA ─────────────
+function buildPasswordResetEmail({ name, resetUrl, lang }) {
+  const copy = {
+    es: {
+      subject: "Restablece tu contraseña — FairCompes AI",
+      greeting: `Hola${name ? `, ${name}` : ""} 👋`,
+      intro: "Recibimos una solicitud para restablecer tu contraseña en FairCompes AI.",
+      instruction: "Haz clic en el botón para crear una nueva contraseña:",
+      button: "Restablecer mi contraseña",
+      expiry: "Este enlace expira en 30 minutos.",
+      ignore: "Si no solicitaste esto, ignora este correo. Tu contraseña actual sigue siendo válida.",
+    },
+    en: {
+      subject: "Reset your password — FairCompes AI",
+      greeting: `Hello${name ? `, ${name}` : ""} 👋`,
+      intro: "We received a request to reset your FairCompes AI password.",
+      instruction: "Click the button below to create a new password:",
+      button: "Reset my password",
+      expiry: "This link expires in 30 minutes.",
+      ignore: "If you didn't request this, ignore this email. Your current password remains valid.",
+    },
+    fr: {
+      subject: "Réinitialisez votre mot de passe — FairCompes AI",
+      greeting: `Bonjour${name ? `, ${name}` : ""} 👋`,
+      intro: "Nous avons reçu une demande de réinitialisation de votre mot de passe FairCompes AI.",
+      instruction: "Cliquez sur le bouton pour créer un nouveau mot de passe :",
+      button: "Réinitialiser mon mot de passe",
+      expiry: "Ce lien expire dans 30 minutes.",
+      ignore: "Si vous n'avez pas demandé cela, ignorez cet e-mail.",
+    },
+  };
+  const t = copy[lang] || copy.es;
+  const html = `<!DOCTYPE html>
+<html lang="${lang}">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#060910;font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#060910;padding:40px 16px;">
+    <tr><td align="center">
+      <table width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#0c1220;border:1px solid #182030;border-radius:16px;overflow:hidden;">
+        <tr>
+          <td align="center" style="padding:40px 32px 24px;">
+            <div style="font-size:32px;margin-bottom:8px;">⚖️</div>
+            <div style="font-size:18px;font-weight:800;color:#c9a84c;letter-spacing:0.5px;">FAIR COMPES AI</div>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:0 32px 32px;">
+            <p style="color:#e8edf5;font-size:16px;font-weight:700;margin:0 0 12px;">${t.greeting}</p>
+            <p style="color:#8899bb;font-size:14px;line-height:1.6;margin:0 0 12px;">${t.intro}</p>
+            <p style="color:#8899bb;font-size:14px;line-height:1.6;margin:0 0 24px;">${t.instruction}</p>
+            <table cellpadding="0" cellspacing="0" style="margin:0 0 24px;">
+              <tr>
+                <td style="border-radius:8px;background:#c9a84c;">
+                  <a href="${resetUrl}" style="display:inline-block;padding:14px 28px;font-size:14px;font-weight:800;color:#000;text-decoration:none;border-radius:8px;">
+                    ${t.button} →
+                  </a>
+                </td>
+              </tr>
+            </table>
+            <p style="color:#445577;font-size:11px;margin:0 0 4px;">⏱ ${t.expiry}</p>
+            <p style="color:#445577;font-size:11px;margin:0 0 16px;">${t.ignore}</p>
+            <p style="color:#2dd4bf;font-size:11px;word-break:break-all;margin:0;">${resetUrl}</p>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+  return { subject: t.subject, html };
+}
+
+// ── SOLICITAR RECUPERACIÓN DE CONTRASEÑA ──────────────────
+app.post('/api/auth/request-password-reset', async (req, res) => {
+  const { email, lang } = req.body || {};
+  if (!email || !email.includes('@')) {
+    return res.status(400).json({ success: false, error: 'invalid_email' });
+  }
+
+  try {
+    const result = await pool.query('SELECT id, first_name FROM users WHERE email = $1', [email]);
+    // Por seguridad, siempre respondemos success (no revelamos si el email existe o no)
+    if (result.rows.length === 0) {
+      return res.json({ success: true });
+    }
+    const user = result.rows[0];
+    const language = ["es", "en", "fr"].includes(lang) ? lang : "es";
+    const jti = crypto.randomUUID();
+    const token = jwt.sign({ userId: user.id, type: "password_reset", jti }, JWT_SECRET, { expiresIn: "30m" });
+    const resetUrl = `${APP_URL}/?reset=${encodeURIComponent(token)}`;
+    const { subject, html } = buildPasswordResetEmail({ name: user.first_name, resetUrl, lang: language });
+
+    try {
+      await resend.emails.send({
+        from: `${FROM_NAME} <${FROM_EMAIL}>`,
+        to: email,
+        subject,
+        html,
+      });
+    } catch (emailErr) {
+      console.error('Password reset email error:', emailErr.message);
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Request password reset error:', err.message);
+    res.status(500).json({ success: false, error: 'internal_error' });
+  }
+});
+
+// ── CONFIRMAR NUEVA CONTRASEÑA ─────────────────────────────
+app.post('/api/auth/reset-password', async (req, res) => {
+  const { token, newPassword } = req.body || {};
+  if (!token) return res.status(400).json({ success: false, error: 'missing_token' });
+  if (!newPassword || newPassword.length < 6) {
+    return res.status(400).json({ success: false, error: 'weak_password' });
+  }
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (payload.type !== 'password_reset') {
+      return res.status(400).json({ success: false, error: 'invalid_token_type' });
+    }
+    if (consumedTokens.has(payload.jti)) {
+      return res.status(400).json({ success: false, error: 'token_already_used' });
+    }
+    consumedTokens.add(payload.jti);
+
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    await pool.query(`UPDATE users SET password_hash = $1 WHERE id = $2`, [passwordHash, payload.userId]);
+
+    // Invalida todas las sesiones activas por seguridad (fuerza nuevo login con la nueva contraseña)
+    await pool.query(`DELETE FROM sessions WHERE user_id = $1`, [payload.userId]);
+
+    await pool.query(
+      `INSERT INTO audit_logs (user_id, event_type) VALUES ($1, 'password_reset')`,
+      [payload.userId]
+    );
+
+    console.log('Password reset successful for user:', payload.userId);
+    res.json({ success: true });
+  } catch (err) {
+    if (err.name === 'TokenExpiredError') {
+      return res.status(400).json({ success: false, error: 'token_expired' });
+    }
+    console.error('Reset password error:', err.message);
+    res.status(400).json({ success: false, error: 'invalid_token' });
+  }
+});// ── HEALTH CHECK ──────────────────────────────────────────
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 // =====================================================================
